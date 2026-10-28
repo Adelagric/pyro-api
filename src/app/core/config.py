@@ -9,7 +9,7 @@ import secrets
 import socket
 from typing import Union
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 __all__ = ["settings"]
@@ -52,6 +52,57 @@ class Settings(BaseSettings):
         # Compose passes an empty value when no secret is configured. Normalize it
         # after settings loading so it cannot replace the generated default.
         return v or secrets.token_urlsafe(32)
+
+    # Keycloak (OIDC) user authentication. When the issuer is unset, Keycloak tokens are rejected.
+    KEYCLOAK_ISSUER: Union[str, None] = os.environ.get("KEYCLOAK_ISSUER") or None
+    # Realm URL the API uses to call Keycloak (signing keys, token introspection). Defaults to the issuer; override
+    # it when the API reaches Keycloak on a different host than the browser (e.g. `keycloak:9310` inside Docker).
+    KEYCLOAK_BACKCHANNEL_URL: Union[str, None] = os.environ.get("KEYCLOAK_BACKCHANNEL_URL") or None
+    # The API's own confidential client: tokens must list it in `aud`, and it authenticates introspection calls
+    KEYCLOAK_CLIENT_ID: str = os.environ.get("KEYCLOAK_CLIENT_ID") or "pyro-api"
+    KEYCLOAK_CLIENT_SECRET: Union[str, None] = os.environ.get("KEYCLOAK_CLIENT_SECRET") or None
+    JWKS_CACHE_SECONDS: int = int(os.environ.get("JWKS_CACHE_SECONDS") or 3600)
+    JWT_LEEWAY_SECONDS: int = int(os.environ.get("JWT_LEEWAY_SECONDS") or 30)
+    # API-issued (HS256) user tokens from /login/creds. Camera tokens are always accepted.
+    LEGACY_USER_TOKENS_ENABLED: bool = os.environ.get("LEGACY_USER_TOKENS_ENABLED", "").lower() != "false"
+
+    @field_validator("KEYCLOAK_ISSUER", "KEYCLOAK_BACKCHANNEL_URL", "KEYCLOAK_CLIENT_SECRET")
+    @classmethod
+    def keycloak_value_can_be_blank(cls, v: Union[str, None]) -> Union[str, None]:
+        # The issuer is compared to the `iss` claim as is, so it is not normalized
+        return v or None
+
+    @field_validator(
+        "KEYCLOAK_CLIENT_ID", "JWKS_CACHE_SECONDS", "JWT_LEEWAY_SECONDS", "LEGACY_USER_TOKENS_ENABLED", mode="before"
+    )
+    @classmethod
+    def blank_keycloak_settings_use_defaults(cls, v: object, info: ValidationInfo) -> object:
+        # Compose passes unset variables as empty strings, which would otherwise override the defaults
+        if v == "" and info.field_name is not None:
+            return cls.model_fields[info.field_name].default
+        return v
+
+    @model_validator(mode="after")
+    def keycloak_needs_client_secret(self) -> "Settings":
+        # Every Keycloak token is introspected, which requires the API's client credentials
+        if self.KEYCLOAK_ISSUER is not None and self.KEYCLOAK_CLIENT_SECRET is None:
+            raise ValueError("KEYCLOAK_CLIENT_SECRET is required when KEYCLOAK_ISSUER is set")
+        return self
+
+    @property
+    def keycloak_backchannel_url(self) -> Union[str, None]:
+        url = self.KEYCLOAK_BACKCHANNEL_URL or self.KEYCLOAK_ISSUER
+        return url.rstrip("/") if url else None
+
+    @property
+    def keycloak_jwks_url(self) -> Union[str, None]:
+        base = self.keycloak_backchannel_url
+        return f"{base}/protocol/openid-connect/certs" if base else None
+
+    @property
+    def keycloak_introspection_url(self) -> Union[str, None]:
+        base = self.keycloak_backchannel_url
+        return f"{base}/protocol/openid-connect/token/introspect" if base else None
 
     # DB conversion
     MAX_BOXES_PER_DETECTION: int = 5
